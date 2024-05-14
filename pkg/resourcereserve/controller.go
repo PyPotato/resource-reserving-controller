@@ -2,10 +2,11 @@ package resourcereserve
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
-	"k8s.io/apimachinery/pkg/api/errors"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -19,10 +20,12 @@ import (
 )
 
 const (
-	workNum       = 3
-	maxRetry      = 10
-	namespace     = "reservation"
-	finalizerName = "reserve.kubernetes.io/finalizer"
+	workNum           = 3
+	maxRetry          = 10
+	namespace         = "reservation"
+	finalizerName     = "reserve.kubernetes.io/finalizer"
+	annotationKeyName = "reserve.kubernetes.io/resources"
+	configMapName     = "pod-node-info"
 )
 
 type controller struct {
@@ -71,20 +74,235 @@ func (c *controller) reconcile(key string) error {
 		return nil
 	}
 
-	// TODO ADD & UPDATE
+	// ADD & UPDATE
+	// 判断pod是否调度成功
+	if pod.Spec.NodeName == "" {
+		// ADD 到此为止
+		klog.Info("Scheduling or schedule failed")
+		return nil
+	}
+	// 调度成功 —— Update
+	// 获取 pod 的 ownerReference，Deployment 和 StatefulSet 分别处理
+	ownerRefList := pod.ObjectMeta.OwnerReferences
+	if len(ownerRefList) == 0 {
+		klog.Info("Pod has no owner reference")
+		return nil
+	}
+	// for _, ownerRef := range ownerRefList {
+	// 	switch ownerRef.Kind {
+	// 	case "Deployment":
+	// 		c.syncDeployment()
+	// 	case "StatefulSet":
+	// 		c.syncStatefulSet(pod)
+	// 	}
+	// }
 
+	// 采用统一策略
+	if err := c.syncNodeAnnotation(pod); err != nil {
+		klog.Error("Failed to sync node annotation", err)
+		return err
+	}
 
 	return nil
 }
 
-func (c *controller) handlePodDelete(pod *corev1.Pod) error {
-	// TODO Add annotations according to resources required
+func (c *controller) syncNodeAnnotation(pod *corev1.Pod) error {
+	// 尝试获取 configMap
+	configMap, err := c.client.CoreV1().ConfigMaps(namespace).Get(context.Background(), configMapName, metav1.GetOptions{})
+	if err != nil {
+		// Create the ConfigMap if it doesn't exist
+		if errors.IsNotFound(err) {
+			configMap = &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      configMapName,
+					Namespace: namespace,
+				},
+				Data: map[string]string{},
+			}
+			_, err := c.client.CoreV1().ConfigMaps(namespace).Create(context.Background(), configMap, metav1.CreateOptions{})
+			if err != nil {
+				klog.Error("Failed to create configMap", err)
+				return err
+			}
+		} else {
+			klog.Error("Failed to get configMap", err)
+			return err
+		}
+	}
+	// 查找原 pod 的 nodeName
+	ownerUid := pod.ObjectMeta.OwnerReferences[0].UID
+	ownerUidNodeInfo := configMap.Data
+	if _, ok := ownerUidNodeInfo[string(ownerUid)]; !ok {
+		klog.Info("Pod did not reserve resources")
+		return err
+	}
+	nodeNameList, err := deserializeStringSlice(ownerUidNodeInfo[string(ownerUid)])
+	if err != nil {
+		klog.Error("Failed to deserialize string slice", err)
+		return err
+	}
+	nodeName := nodeNameList[0]
+	if len(nodeNameList) == 1 {
+		delete(ownerUidNodeInfo, string(ownerUid))
+	} else {
+		nodeNameList = nodeNameList[1:]
+		ownerUidNodeInfo[string(ownerUid)], err = serializeStringSlice(nodeNameList)
+		if err != nil {
+			klog.Error("Failed to serialize string slice", err)
+			return err
+		}
+	}
+	configMap.Data = ownerUidNodeInfo
+	if _, err = c.updateConfigMap(configMap); err != nil {
+		klog.Error("Failed to update configMap", err)
+		return err
+	}
+	// 获取 node 更新 Annotation
+	node, err := c.client.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
+	if err != nil {
+		klog.Error("Failed to get node", err)
+		return err
+	}
+	annotationValue, exists := node.Annotations[annotationKeyName]
+	if !exists {
+		klog.Info("Annotation ", annotationKeyName, " does not exist on node ", node.GetName())
+		return err
+	}
+
+	// Parse the value
+	var reservedResources []ReservationItem
+	err = json.Unmarshal([]byte(annotationValue), &reservedResources)
+	if err != nil {
+		klog.Error("Failed to unmarshal annotation value", err)
+		return err
+	}
+
+	// Update the annotation
+	updateReservedResources(&reservedResources, string(ownerUid), pod)
+
+	// Update the node
+	annotationValueJson, err := json.Marshal(reservedResources)
+	if err != nil {
+		klog.Error("Failed to marshal annotation value", err)
+		return err
+	}
+	node.Annotations[annotationKeyName] = string(annotationValueJson)
+	_, err = c.updateNode(node)
+	if err != nil {
+		klog.Error("Failed to update node", err)
+		return err
+	}
 
 	return nil
+}
+
+// func (c *controller) syncDeployment() {
+// 	// TODO 获取 configMap，从中找到 key 为本 pod 的 ownerReferenceUid 的 value，取一个减去资源预留量
+// }
+
+// func (c *controller) syncStatefulSet(pod *corev1.Pod) {
+// 	// TODO 可以用和 Deplotment 同样的方法
+// }
+
+func (c *controller) handlePodDelete(pod *corev1.Pod) error {
+	ownerUid := string(pod.ObjectMeta.OwnerReferences[0].UID)
+  
+	// Retrieve the name of the node where the pod is scheduled
+	nodeName := pod.Spec.NodeName
+  
+	// Get the Node object using nodeName
+	node, err := c.client.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
+	if err != nil {
+	  // handle error
+	}
+  
+	// Get current annotations of the node
+	annotations := node.ObjectMeta.Annotations
+  
+	// Declare and initialize the total CPU and Memory requests
+	totalCPURequest := int64(0)
+	totalMemoryRequest := int64(0)
+  
+	// Calculate the total CPU and Memory requests by summing the requests of all containers in the Pod
+	for _, container := range pod.Spec.Containers {
+	  totalCPURequest += container.Resources.Requests.Cpu().MilliValue()
+	  totalMemoryRequest += container.Resources.Requests.Memory().Value()
+	}
+  
+	// Get and unmarshal the existing reservations from the annotations
+	var ReservationList []ReservationItem
+	found := false
+	if value, exists := annotations[annotationKeyName]; exists {
+	  // Unmarshalling the annotations
+	  if err := json.Unmarshal([]byte(value), &ReservationList); err != nil {
+		// handle error
+	  }
+	
+	  // Loop through existing reservations
+	  for i, reservation := range ReservationList {
+		if reservation.OwnerUID == ownerUid {
+		  // We found a reservation from the same OwnerUID
+		  found = true
+		  for j, resource := range reservation.ReservedResources {
+			if resource.ResourceType == "cpu" {
+			  ReservationList[i].ReservedResources[j].ReservedQuantity += totalCPURequest
+			} else if resource.ResourceType == "memory" {
+			  ReservationList[i].ReservedResources[j].ReservedQuantity += totalMemoryRequest
+			}
+		  }
+		}
+	  }
+	}
+
+	// if no matching reservation is found, create a new one
+	if !found {
+		ReservationList = append(ReservationList, ReservationItem{
+			OwnerType: pod.ObjectMeta.OwnerReferences[0].Kind,
+			OwnerUID: ownerUid,
+			PodName: pod.Name,
+			ReservedResources: []ReservedResource{
+				{
+					ResourceType: "cpu",
+					ReservedQuantity: totalCPURequest,
+				},
+				{
+					ResourceType: "memory",
+					ReservedQuantity: totalMemoryRequest,
+				},
+			},
+		})
+	}
+	newReservationListJson, err := json.Marshal(ReservationList)
+	if err != nil {
+		klog.Error("Failed to marshal annotation value", err)
+		return err
+	}
+
+	annotations[annotationKeyName] = string(newReservationListJson)
+
+	// Update the node with the new annotations
+
+	// Update the node
+	node.ObjectMeta.Annotations = annotations
+	_, err = c.updateNode(node)
+	if err != nil {
+		klog.Error("Failed to update node", err)
+		return err
+	}
+
+	return nil
+}
+
+func (c *controller) updateNode(node *corev1.Node) (*corev1.Node, error) {
+	return c.client.CoreV1().Nodes().Update(context.Background(), node, metav1.UpdateOptions{})
 }
 
 func (c *controller) updatePod(pod *corev1.Pod) (*corev1.Pod, error) {
 	return c.client.CoreV1().Pods(pod.Namespace).Update(context.Background(), pod, metav1.UpdateOptions{})
+}
+
+func (c *controller) updateConfigMap(configMap *corev1.ConfigMap) (*corev1.ConfigMap, error) {
+	return c.client.CoreV1().ConfigMaps(configMap.Namespace).Update(context.Background(), configMap, metav1.UpdateOptions{})
 }
 
 func (c *controller) handleErr(key string, err error) {
@@ -233,7 +451,7 @@ func NewController(client kubernetes.Interface, podInformer informer.PodInformer
 	}
 
 	podInformer.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: c.onPodAdded,
+		AddFunc:    c.onPodAdded,
 		DeleteFunc: c.onPodDeleted,
 		UpdateFunc: c.onPodUpdated,
 	})
