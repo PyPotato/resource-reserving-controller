@@ -35,6 +35,7 @@ type controller struct {
 }
 
 func (c *controller) reconcile(key string) error {
+	klog.Info("Reconciling")
 	podNamespace, podName, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err
@@ -106,11 +107,13 @@ func (c *controller) reconcile(key string) error {
 	return nil
 }
 
+// 调度完成后，删除之前为之预留的资源
 func (c *controller) syncNodeAnnotation(pod *corev1.Pod) error {
 	// 尝试获取 configMap
 	configMap, err := c.client.CoreV1().ConfigMaps(namespace).Get(context.Background(), configMapName, metav1.GetOptions{})
 	if err != nil {
 		// Create the ConfigMap if it doesn't exist
+		klog.Info("ConfigMap not found, creating...")
 		if errors.IsNotFound(err) {
 			configMap = &corev1.ConfigMap{
 				ObjectMeta: metav1.ObjectMeta{
@@ -129,11 +132,11 @@ func (c *controller) syncNodeAnnotation(pod *corev1.Pod) error {
 			return err
 		}
 	}
-	// 查找原 pod 的 nodeName
+	// 1. 查找原 pod 的 nodeName
 	ownerUid := pod.ObjectMeta.OwnerReferences[0].UID
 	ownerUidNodeInfo := configMap.Data
 	if _, ok := ownerUidNodeInfo[string(ownerUid)]; !ok {
-		klog.Info("Pod did not reserve resources")
+		klog.Info("Did not find ownerUid as a key in configMap")
 		return err
 	}
 	nodeNameList, err := deserializeStringSlice(ownerUidNodeInfo[string(ownerUid)])
@@ -157,7 +160,7 @@ func (c *controller) syncNodeAnnotation(pod *corev1.Pod) error {
 		klog.Error("Failed to update configMap", err)
 		return err
 	}
-	// 获取 node 更新 Annotation
+	// 2. 获取 node 更新 Annotation
 	node, err := c.client.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
 	if err != nil {
 		klog.Error("Failed to get node", err)
@@ -205,68 +208,81 @@ func (c *controller) syncNodeAnnotation(pod *corev1.Pod) error {
 // }
 
 func (c *controller) handlePodDelete(pod *corev1.Pod) error {
+	klog.Info("Handling Pod Delete(reserving resources)")
 	ownerUid := string(pod.ObjectMeta.OwnerReferences[0].UID)
-  
+
 	// Retrieve the name of the node where the pod is scheduled
 	nodeName := pod.Spec.NodeName
-  
+
 	// Get the Node object using nodeName
 	node, err := c.client.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
 	if err != nil {
-	  // handle error
+		// handle error
 	}
-  
+
 	// Get current annotations of the node
 	annotations := node.ObjectMeta.Annotations
-  
+
 	// Declare and initialize the total CPU and Memory requests
 	totalCPURequest := int64(0)
 	totalMemoryRequest := int64(0)
-  
+
 	// Calculate the total CPU and Memory requests by summing the requests of all containers in the Pod
 	for _, container := range pod.Spec.Containers {
-	  totalCPURequest += container.Resources.Requests.Cpu().MilliValue()
-	  totalMemoryRequest += container.Resources.Requests.Memory().Value()
+		totalCPURequest += container.Resources.Requests.Cpu().MilliValue()
+		totalMemoryRequest += container.Resources.Requests.Memory().Value()
 	}
-  
+	klog.Info("Total CPU request: ", totalCPURequest)
+	klog.Info("Total Memory request: ", totalMemoryRequest)
+
 	// Get and unmarshal the existing reservations from the annotations
 	var ReservationList []ReservationItem
 	found := false
 	if value, exists := annotations[annotationKeyName]; exists {
-	  // Unmarshalling the annotations
-	  if err := json.Unmarshal([]byte(value), &ReservationList); err != nil {
-		// handle error
-	  }
-	
-	  // Loop through existing reservations
-	  for i, reservation := range ReservationList {
-		if reservation.OwnerUID == ownerUid {
-		  // We found a reservation from the same OwnerUID
-		  found = true
-		  for j, resource := range reservation.ReservedResources {
-			if resource.ResourceType == "cpu" {
-			  ReservationList[i].ReservedResources[j].ReservedQuantity += totalCPURequest
-			} else if resource.ResourceType == "memory" {
-			  ReservationList[i].ReservedResources[j].ReservedQuantity += totalMemoryRequest
-			}
-		  }
+		// Unmarshalling the annotations
+		if err := json.Unmarshal([]byte(value), &ReservationList); err != nil {
+			klog.Error("Failed to unmarshal annotation value", err)
+			return err
 		}
-	  }
+
+		// Loop through existing reservations
+		for i, reservation := range ReservationList {
+			if reservation.OwnerUID == ownerUid {
+				// We found a reservation from the same OwnerUID
+				found = true
+
+				klog.Info("Before reserving for the pod")
+				printReservedResources(&reservation)
+
+				for j, resource := range reservation.ReservedResources {
+					if resource.ResourceType == "cpu" {
+						ReservationList[i].ReservedResources[j].ReservedQuantity += totalCPURequest
+					} else if resource.ResourceType == "memory" {
+						ReservationList[i].ReservedResources[j].ReservedQuantity += totalMemoryRequest
+					}
+				}
+
+				klog.Info("After reserving for the pod")
+				printReservedResources(&reservation)
+				break
+			}
+		}
 	}
 
 	// if no matching reservation is found, create a new one
 	if !found {
+		klog.Info("No matching reservation found, creating a new one")
 		ReservationList = append(ReservationList, ReservationItem{
 			OwnerType: pod.ObjectMeta.OwnerReferences[0].Kind,
-			OwnerUID: ownerUid,
-			PodName: pod.Name,
+			OwnerUID:  ownerUid,
+			PodName:   pod.Name,
 			ReservedResources: []ReservedResource{
 				{
-					ResourceType: "cpu",
+					ResourceType:     "cpu",
 					ReservedQuantity: totalCPURequest,
 				},
 				{
-					ResourceType: "memory",
+					ResourceType:     "memory",
 					ReservedQuantity: totalMemoryRequest,
 				},
 			},
@@ -281,14 +297,63 @@ func (c *controller) handlePodDelete(pod *corev1.Pod) error {
 	annotations[annotationKeyName] = string(newReservationListJson)
 
 	// Update the node with the new annotations
-
-	// Update the node
 	node.ObjectMeta.Annotations = annotations
 	_, err = c.updateNode(node)
 	if err != nil {
 		klog.Error("Failed to update node", err)
 		return err
 	}
+
+	// 在 configMap 中添加 [ownerUid]nodeName
+	// 尝试获取 configMap
+	configMap, err := c.client.CoreV1().ConfigMaps(namespace).Get(context.Background(), configMapName, metav1.GetOptions{})
+	if err != nil {
+		// Create the ConfigMap if it doesn't exist
+		klog.Info("ConfigMap not found, creating...")
+		if errors.IsNotFound(err) {
+			configMap = &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      configMapName,
+					Namespace: namespace,
+				},
+				Data: map[string]string{},
+			}
+			_, err := c.client.CoreV1().ConfigMaps(namespace).Create(context.Background(), configMap, metav1.CreateOptions{})
+			if err != nil {
+				klog.Error("Failed to create configMap", err)
+				return err
+			}
+		} else {
+			klog.Error("Failed to get configMap", err)
+			return err
+		}
+	}
+	ownerUidNodeInfo := configMap.Data
+	if _, ok := ownerUidNodeInfo[string(ownerUid)]; !ok {
+		klog.Info("Add new item to configMap")
+		ownerUidNodeInfo[string(ownerUid)] = string(nodeName)
+
+	} else {
+		klog.Info("Append nodeName to existing item of configMap")
+		nodeNameList, err := deserializeStringSlice(ownerUidNodeInfo[string(ownerUid)])
+		if err != nil {
+			klog.Error("Failed to deserialize string slice", err)
+			return err
+		}
+		nodeNameList = append(nodeNameList, nodeName)
+		ownerUidNodeInfo[string(ownerUid)], err = serializeStringSlice(nodeNameList)
+		if err != nil {
+			klog.Error("Failed to serialize string slice", err)
+			return err
+		}
+	}
+	configMap.Data = ownerUidNodeInfo
+	if _, err = c.updateConfigMap(configMap); err != nil {
+		klog.Error("Failed to update configMap", err)
+		return err
+	}
+
+	klog.Info("Finish Reserving, take a look at the annotations~")
 
 	return nil
 }
@@ -337,6 +402,7 @@ func (c *controller) judgeDeployment(ownerRef metav1.OwnerReference, namespace s
 	}
 	// pod 被删除并且 readyReplicas < Replicas —— pod重建
 	if *deployment.Spec.Replicas > deployment.Status.ReadyReplicas {
+		klog.Info("Pod is reconstructing")
 		return true
 	} else {
 		return false
@@ -351,6 +417,7 @@ func (c *controller) judgeStatefulSet(ownerRef metav1.OwnerReference, namespace 
 	}
 
 	if *statefulset.Spec.Replicas > statefulset.Status.ReadyReplicas {
+		klog.Info("Pod is reconstructing")
 		return true
 	} else {
 		return false
@@ -390,6 +457,7 @@ func (c *controller) onPodAdded(obj interface{}) {
 	if !c.isReservable(obj) {
 		return
 	}
+	klog.Info("Pod added")
 	c.enqueue(obj)
 }
 
@@ -403,7 +471,7 @@ func (c *controller) onPodDeleted(obj interface{}) {
 	if !c.isReconstruction(obj) {
 		return
 	}
-
+	klog.Info("Pod deleted")
 	c.enqueue(obj)
 }
 
@@ -412,13 +480,16 @@ func (c *controller) onPodUpdated(oldObj interface{}, newObj interface{}) {
 	if !c.isReservable(oldObj) || !c.isReservable(newObj) {
 		return
 	}
+	klog.Info("Pod updated")
 	c.enqueue(newObj)
 }
 
 func (c *controller) Run(stopCh <-chan struct{}) {
+	klog.Info("Running")
 	for i := 0; i < workNum; i++ {
 		go wait.Until(c.worker, time.Minute, stopCh)
 	}
+	<-stopCh
 }
 
 func (c *controller) worker() {

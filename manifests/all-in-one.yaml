@@ -39,6 +39,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: resourcereserve-controller-deployment
+  namespace: reservation
   labels:
     app: resourcereserve-controller
 spec:

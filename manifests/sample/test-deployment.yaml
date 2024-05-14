@@ -1,0 +1,27 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: testngx
+  namespace: default
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: testngx
+  template:
+    metadata:
+      labels:
+        app: testngx
+        reserve.kubernetes.io/resources: "true"
+    spec:
+      schedulerName: test-scheduler
+      containers:
+        - image: nginx
+          imagePullPolicy: IfNotPresent
+          name: testngx
+          ports:
+            - containerPort: 80
+          resources:
+            requests:
+              cpu: "1000m"
+              memory: "128Mi"   
