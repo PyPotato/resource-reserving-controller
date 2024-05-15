@@ -2,9 +2,9 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: testngx
-  namespace: default
+  namespace: reservation
 spec:
-  replicas: 3
+  replicas: 1
   selector:
     matchLabels:
       app: testngx
@@ -23,5 +23,5 @@ spec:
             - containerPort: 80
           resources:
             requests:
-              cpu: "1000m"
+              cpu: "4000m"
               memory: "128Mi"   

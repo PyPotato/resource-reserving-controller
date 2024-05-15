@@ -20,7 +20,7 @@ import (
 )
 
 const (
-	workNum           = 3
+	workNum           = 1
 	maxRetry          = 10
 	namespace         = "reservation"
 	finalizerName     = "reserve.kubernetes.io/finalizer"
@@ -100,7 +100,7 @@ func (c *controller) reconcile(key string) error {
 
 	// 采用统一策略
 	if err := c.syncNodeAnnotation(pod); err != nil {
-		klog.Error("Failed to sync node annotation", err)
+		klog.Error("Failed to sync node annotation: ", err)
 		return err
 	}
 
@@ -120,28 +120,32 @@ func (c *controller) syncNodeAnnotation(pod *corev1.Pod) error {
 					Name:      configMapName,
 					Namespace: namespace,
 				},
-				Data: map[string]string{},
+				Data: make(map[string]string),
 			}
 			_, err := c.client.CoreV1().ConfigMaps(namespace).Create(context.Background(), configMap, metav1.CreateOptions{})
 			if err != nil {
-				klog.Error("Failed to create configMap", err)
+				klog.Error("Failed to create configMap: ", err)
 				return err
 			}
 		} else {
-			klog.Error("Failed to get configMap", err)
+			klog.Error("Failed to get configMap: ", err)
 			return err
 		}
 	}
 	// 1. 查找原 pod 的 nodeName
 	ownerUid := pod.ObjectMeta.OwnerReferences[0].UID
 	ownerUidNodeInfo := configMap.Data
+	if ownerUidNodeInfo == nil {
+		// If it's nil, we need to initialize it
+		ownerUidNodeInfo = make(map[string]string)
+	}
 	if _, ok := ownerUidNodeInfo[string(ownerUid)]; !ok {
 		klog.Info("Did not find ownerUid as a key in configMap")
 		return err
 	}
 	nodeNameList, err := deserializeStringSlice(ownerUidNodeInfo[string(ownerUid)])
 	if err != nil {
-		klog.Error("Failed to deserialize string slice", err)
+		klog.Error("Failed to deserialize string slice: ", err)
 		return err
 	}
 	nodeName := nodeNameList[0]
@@ -151,19 +155,19 @@ func (c *controller) syncNodeAnnotation(pod *corev1.Pod) error {
 		nodeNameList = nodeNameList[1:]
 		ownerUidNodeInfo[string(ownerUid)], err = serializeStringSlice(nodeNameList)
 		if err != nil {
-			klog.Error("Failed to serialize string slice", err)
+			klog.Error("Failed to serialize string slice: ", err)
 			return err
 		}
 	}
 	configMap.Data = ownerUidNodeInfo
 	if _, err = c.updateConfigMap(configMap); err != nil {
-		klog.Error("Failed to update configMap", err)
+		klog.Error("Failed to update configMap: ", err)
 		return err
 	}
 	// 2. 获取 node 更新 Annotation
 	node, err := c.client.CoreV1().Nodes().Get(context.Background(), nodeName, metav1.GetOptions{})
 	if err != nil {
-		klog.Error("Failed to get node", err)
+		klog.Error("Failed to get node: ", err)
 		return err
 	}
 	annotationValue, exists := node.Annotations[annotationKeyName]
@@ -176,7 +180,7 @@ func (c *controller) syncNodeAnnotation(pod *corev1.Pod) error {
 	var reservedResources []ReservationItem
 	err = json.Unmarshal([]byte(annotationValue), &reservedResources)
 	if err != nil {
-		klog.Error("Failed to unmarshal annotation value", err)
+		klog.Error("Failed to unmarshal annotation value: ", err)
 		return err
 	}
 
@@ -186,13 +190,13 @@ func (c *controller) syncNodeAnnotation(pod *corev1.Pod) error {
 	// Update the node
 	annotationValueJson, err := json.Marshal(reservedResources)
 	if err != nil {
-		klog.Error("Failed to marshal annotation value", err)
+		klog.Error("Failed to marshal annotation value: ", err)
 		return err
 	}
 	node.Annotations[annotationKeyName] = string(annotationValueJson)
 	_, err = c.updateNode(node)
 	if err != nil {
-		klog.Error("Failed to update node", err)
+		klog.Error("Failed to update node: ", err)
 		return err
 	}
 
@@ -217,7 +221,7 @@ func (c *controller) handlePodDelete(pod *corev1.Pod) error {
 	// Get the Node object using nodeName
 	node, err := c.client.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
 	if err != nil {
-		// handle error
+		// TODO handle error
 	}
 
 	// Get current annotations of the node
@@ -241,7 +245,7 @@ func (c *controller) handlePodDelete(pod *corev1.Pod) error {
 	if value, exists := annotations[annotationKeyName]; exists {
 		// Unmarshalling the annotations
 		if err := json.Unmarshal([]byte(value), &ReservationList); err != nil {
-			klog.Error("Failed to unmarshal annotation value", err)
+			klog.Error("Failed to unmarshal annotation value: ", err)
 			return err
 		}
 
@@ -290,7 +294,7 @@ func (c *controller) handlePodDelete(pod *corev1.Pod) error {
 	}
 	newReservationListJson, err := json.Marshal(ReservationList)
 	if err != nil {
-		klog.Error("Failed to marshal annotation value", err)
+		klog.Error("Failed to marshal annotation value: ", err)
 		return err
 	}
 
@@ -300,7 +304,7 @@ func (c *controller) handlePodDelete(pod *corev1.Pod) error {
 	node.ObjectMeta.Annotations = annotations
 	_, err = c.updateNode(node)
 	if err != nil {
-		klog.Error("Failed to update node", err)
+		klog.Error("Failed to update node: ", err)
 		return err
 	}
 
@@ -316,40 +320,49 @@ func (c *controller) handlePodDelete(pod *corev1.Pod) error {
 					Name:      configMapName,
 					Namespace: namespace,
 				},
-				Data: map[string]string{},
+				Data: make(map[string]string),
 			}
 			_, err := c.client.CoreV1().ConfigMaps(namespace).Create(context.Background(), configMap, metav1.CreateOptions{})
 			if err != nil {
-				klog.Error("Failed to create configMap", err)
+				klog.Error("Failed to create configMap: ", err)
 				return err
 			}
 		} else {
-			klog.Error("Failed to get configMap", err)
+			klog.Error("Failed to get configMap: ", err)
 			return err
 		}
 	}
 	ownerUidNodeInfo := configMap.Data
+	if ownerUidNodeInfo == nil {
+		// If it's nil, we need to initialize it
+		ownerUidNodeInfo = make(map[string]string)
+	}
 	if _, ok := ownerUidNodeInfo[string(ownerUid)]; !ok {
 		klog.Info("Add new item to configMap")
-		ownerUidNodeInfo[string(ownerUid)] = string(nodeName)
-
+		newNodeNameList := make([]string, 0)
+		newNodeNameList = append(newNodeNameList, nodeName)
+		ownerUidNodeInfo[string(ownerUid)], err = serializeStringSlice(newNodeNameList)
+		if err != nil {
+			klog.Error("Failed to serialize string slice: ", err)
+			return err
+		}
 	} else {
 		klog.Info("Append nodeName to existing item of configMap")
 		nodeNameList, err := deserializeStringSlice(ownerUidNodeInfo[string(ownerUid)])
 		if err != nil {
-			klog.Error("Failed to deserialize string slice", err)
+			klog.Error("Failed to deserialize string slice: ", err)
 			return err
 		}
 		nodeNameList = append(nodeNameList, nodeName)
 		ownerUidNodeInfo[string(ownerUid)], err = serializeStringSlice(nodeNameList)
 		if err != nil {
-			klog.Error("Failed to serialize string slice", err)
+			klog.Error("Failed to serialize string slice: ", err)
 			return err
 		}
 	}
 	configMap.Data = ownerUidNodeInfo
 	if _, err = c.updateConfigMap(configMap); err != nil {
-		klog.Error("Failed to update configMap", err)
+		klog.Error("Failed to update configMap: ", err)
 		return err
 	}
 
@@ -397,7 +410,7 @@ func (c *controller) isReservable(obj interface{}) bool {
 func (c *controller) judgeDeployment(ownerRef metav1.OwnerReference, namespace string) bool {
 	deployment, err := c.client.AppsV1().Deployments(namespace).Get(context.Background(), ownerRef.Name, metav1.GetOptions{})
 	if err != nil {
-		klog.Error("Failed to get deployment", err)
+		klog.Error("Failed to get deployment: ", err)
 		return false
 	}
 	// pod 被删除并且 readyReplicas < Replicas —— pod重建
@@ -412,7 +425,7 @@ func (c *controller) judgeDeployment(ownerRef metav1.OwnerReference, namespace s
 func (c *controller) judgeStatefulSet(ownerRef metav1.OwnerReference, namespace string) bool {
 	statefulset, err := c.client.AppsV1().StatefulSets(namespace).Get(context.Background(), ownerRef.Name, metav1.GetOptions{})
 	if err != nil {
-		klog.Error("Failed to get statefulset", err)
+		klog.Error("Failed to get statefulset: ", err)
 		return false
 	}
 
