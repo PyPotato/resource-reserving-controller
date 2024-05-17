@@ -62,6 +62,17 @@ func (c *controller) reconcile(key string) error {
 	} else {
 		// The object is being deleted
 		klog.Info("Being deleted")
+		// 如果是管理 pod 的 OwnerReference 被删除，则不做处理，直接删 finalizers
+		if c.isOwnerBeingDeleted(pod) {
+			klog.Info("pod is being destroyed due to ownerReference deleted")
+			if controllerutil.ContainsFinalizer(pod, finalizerName) {
+				controllerutil.RemoveFinalizer(pod, finalizerName)
+				if _, err := c.updatePod(pod); err != nil {
+					return err
+				}
+			}
+			return nil
+		}
 		if controllerutil.ContainsFinalizer(pod, finalizerName) {
 			klog.Info("Reserving resources")
 			if err := c.handlePodDelete(pod); err != nil {
@@ -187,13 +198,19 @@ func (c *controller) syncNodeAnnotation(pod *corev1.Pod) error {
 	// Update the annotation
 	updateReservedResources(&reservedResources, string(ownerUid), pod)
 
-	// Update the node
-	annotationValueJson, err := json.Marshal(reservedResources)
-	if err != nil {
-		klog.Error("Failed to marshal annotation value: ", err)
-		return err
+	// Clean zero items
+	if len(reservedResources) == 0 {
+		delete(node.Annotations, annotationKeyName)
+	} else {
+		// Update the node
+		annotationValueJson, err := json.Marshal(reservedResources)
+		if err != nil {
+			klog.Error("Failed to marshal annotation value: ", err)
+			return err
+		}
+		node.Annotations[annotationKeyName] = string(annotationValueJson)
 	}
-	node.Annotations[annotationKeyName] = string(annotationValueJson)
+
 	_, err = c.updateNode(node)
 	if err != nil {
 		klog.Error("Failed to update node: ", err)
@@ -202,14 +219,6 @@ func (c *controller) syncNodeAnnotation(pod *corev1.Pod) error {
 
 	return nil
 }
-
-// func (c *controller) syncDeployment() {
-// 	// TODO 获取 configMap，从中找到 key 为本 pod 的 ownerReferenceUid 的 value，取一个减去资源预留量
-// }
-
-// func (c *controller) syncStatefulSet(pod *corev1.Pod) {
-// 	// TODO 可以用和 Deplotment 同样的方法
-// }
 
 func (c *controller) handlePodDelete(pod *corev1.Pod) error {
 	klog.Info("Handling Pod Delete(reserving resources)")
@@ -221,11 +230,15 @@ func (c *controller) handlePodDelete(pod *corev1.Pod) error {
 	// Get the Node object using nodeName
 	node, err := c.client.CoreV1().Nodes().Get(context.TODO(), nodeName, metav1.GetOptions{})
 	if err != nil {
-		// TODO handle error
+		klog.Error("Failed to get node in func handlePodDelete")
+		return err
 	}
 
 	// Get current annotations of the node
 	annotations := node.ObjectMeta.Annotations
+	if annotations == nil {
+		annotations = make(map[string]string)
+	}
 
 	// Declare and initialize the total CPU and Memory requests
 	totalCPURequest := int64(0)
@@ -458,6 +471,30 @@ func (c *controller) isReconstruction(obj interface{}) bool {
 	return false
 }
 
+func (c *controller) isOwnerBeingDeleted(obj interface{}) bool {
+	metaObj, ok := obj.(metav1.Object)
+	if !ok {
+		return false
+	}
+	for _, ref := range metaObj.GetOwnerReferences() {
+		switch ref.Kind {
+		case "ReplicaSet":
+			// get ReplicaSet
+			klog.Info("Trying to get OwnerReference ", ref.Name)
+			_, err := c.client.AppsV1().ReplicaSets(namespace).Get(context.TODO(), ref.Name, metav1.GetOptions{})
+			if err != nil {
+				return true
+			}
+		case "StatefulSet":
+			_, err := c.client.AppsV1().StatefulSets(namespace).Get(context.TODO(), ref.Name, metav1.GetOptions{})
+			if err != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func (c *controller) enqueue(obj interface{}) {
 	key, err := cache.MetaNamespaceKeyFunc(obj)
 	if err != nil {
@@ -480,10 +517,16 @@ func (c *controller) onPodDeleted(obj interface{}) {
 	if !c.isReservable(obj) {
 		return
 	}
-	// 过滤掉裸 pod 以及 pod 销毁情况
+	// 过滤掉裸 pod 以及由于 replicas 减少导致 pod 销毁情况
 	if !c.isReconstruction(obj) {
 		return
 	}
+	// 过滤掉 pod 的 ownerReference 删除导致 pod 销毁情况
+	// if c.isOwnerBeingDeleted(obj) {
+	// 	klog.Info("Owner is being deleted")
+	// 	return
+	// }
+
 	klog.Info("Pod deleted")
 	c.enqueue(obj)
 }
@@ -493,6 +536,11 @@ func (c *controller) onPodUpdated(oldObj interface{}, newObj interface{}) {
 	if !c.isReservable(oldObj) || !c.isReservable(newObj) {
 		return
 	}
+	// 过滤掉 pod 的 ownerReference 删除导致 pod 销毁情况
+	// if c.isOwnerBeingDeleted(newObj) {
+	// 	klog.Info("Owner is being deleted")
+	// 	return
+	// }
 	klog.Info("Pod updated")
 	c.enqueue(newObj)
 }

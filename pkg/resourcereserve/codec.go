@@ -31,19 +31,48 @@ func updateReservedResources(reservedResources *[]ReservationItem, ownerUid stri
 		totalCPURequest += container.Resources.Requests.Cpu().MilliValue()
 		totalMemoryRequest += container.Resources.Requests.Memory().Value()
 	}
-	for i, reservation := range *reservedResources {
-		if reservation.OwnerUID == ownerUid {
-			for j, resource := range reservation.ReservedResources {
-				resourceType := resource.ResourceType
-				reservedQuanty := resource.ReservedQuantity
+	// for i, reservation := range *reservedResources {
+	// 	if reservation.OwnerUID == ownerUid {
+	// 		for j, resource := range reservation.ReservedResources {
+	// 			resourceType := resource.ResourceType
+	// 			reservedQuanty := resource.ReservedQuantity
+
+	// 			if resourceType == "cpu" {
+	// 				reservedQuanty -= totalCPURequest
+	// 			} else if resourceType == "memory" {
+	// 				reservedQuanty -= totalMemoryRequest
+	// 			}
+	// 			// Update the reserved quantity
+	// 			(*reservedResources)[i].ReservedResources[j].ReservedQuantity = reservedQuanty
+	// 		}
+	// 		break
+	// 	}
+	// }
+	for i := len(*reservedResources) - 1; i >= 0; i-- {
+		if (*reservedResources)[i].OwnerUID == ownerUid {
+			for j := len((*reservedResources)[i].ReservedResources) - 1; j >= 0; j-- {
+				resourceType := (*reservedResources)[i].ReservedResources[j].ResourceType
+				reservedQuanty := &(*reservedResources)[i].ReservedResources[j].ReservedQuantity
 
 				if resourceType == "cpu" {
-					reservedQuanty -= totalCPURequest
+					*reservedQuanty -= totalCPURequest
 				} else if resourceType == "memory" {
-					reservedQuanty -= totalMemoryRequest
+					*reservedQuanty -= totalMemoryRequest
 				}
-				// Update the reserved quantity
-				(*reservedResources)[i].ReservedResources[j].ReservedQuantity = reservedQuanty
+
+				// 如果 ReservedQuantity 为 0，删除这个 ReservedResource
+				if *reservedQuanty <= 0 {
+					(*reservedResources)[i].ReservedResources = append(
+						(*reservedResources)[i].ReservedResources[:j],
+						(*reservedResources)[i].ReservedResources[j+1:]...)
+				}
+			}
+
+			// 如果 ReservedResources 为空，删除这个 ReservedResource 对象
+			if len((*reservedResources)[i].ReservedResources) == 0 {
+				*reservedResources = append(
+					(*reservedResources)[:i],
+					(*reservedResources)[i+1:]...)
 			}
 			break
 		}
